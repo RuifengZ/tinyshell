@@ -167,29 +167,47 @@ void eval(char *cmdline)
 {
 	char *argv [MAXARGS];
 	pid_t pid;
+	sigset_t mask;
 	int bg = parseline(cmdline, argv);
 	
+	if(argv[0] == NULL)
+		return;
+
 	if(builtin_cmd(argv) != 1)
 	{
+		sigemptyset(&mask);
+		sigaddset(&mask, SIGCHLD);
+		sigaddset(&mask, SIGINT);
+		sigaddset(&mask, SIGTSTP);
+		sigprocmask(SIG_BLOCK, &mask, NULL);
 		if((pid = fork()) == 0)
 		{
+			setpgid(0, 0);
+			sigprocmask(SIG_UNBLOCK, &mask, NULL);
 			//printf("pid in child=%d and parent=%d\n",getpid(),getppid()); 
 			if (execve(argv[0], argv, environ) < 0)
 			{ 
-				printf("%s: Command not found.\n", argv[0]); 
+				printf("%s: Command not found.\n", argv[0]);
 				exit(0);
 			}
 			return;
 		}
 
-		if(!bg)
+		if(bg)
 		{
-			addjob(jobs, pid, FG, cmdline);
-			waitfg(pid);
+			addjob(jobs, pid, BG, cmdline);
+			if(verbose)
+				printf("Added background job\n");
+			printf("[%d] (%d) %s", pid2jid(pid), pid, cmdline);
+			sigprocmask(SIG_UNBLOCK, &mask, NULL);
 		}
 		else
 		{
-			addjob(jobs, pid, BG, cmdline);
+			addjob(jobs, pid, FG, cmdline);
+			sigprocmask(SIG_UNBLOCK, &mask, NULL);
+			if(verbose)
+				printf("Added foreground job\n");
+			waitfg(pid);
 		}
 	}
 	//printf("Input: %s\n", argv[0]);
@@ -260,7 +278,7 @@ int parseline(const char *cmdline, char **argv)
 int builtin_cmd(char **argv) 
 {
 	if(strcmp(argv[0], "quit") == 0)
-		exit(1);
+		exit(0);
 	if(strcmp(argv[0], "jobs") == 0)
 	{
 		listjobs(jobs);
@@ -280,7 +298,6 @@ int builtin_cmd(char **argv)
  */
 void do_bgfg(char **argv) 
 {
-	int bg = (strcmp(argv[0], "bg") == 0);
 	struct  job_t *job = NULL;
 
 	if(argv[1] == NULL)
@@ -290,7 +307,7 @@ void do_bgfg(char **argv)
 	}
 	if(argv[1][0] == '%')
 	{
-		if((job = getjobjid(jobs, atoi((char*)(argv[1]+1)))) == NULL)
+		if((job = getjobjid(jobs, atoi(&argv[1][1]))) == NULL)
 		{
 			printf("ERROR: Job does not exist\n");
 			return;
@@ -298,23 +315,25 @@ void do_bgfg(char **argv)
 	}
 	else
 	{
-		if((job = getjobpid(jobs, atoi((char*)argv[1]))) == NULL)
+		if((job = getjobpid(jobs, atoi(argv[1]))) == NULL)
 		{
 			printf("ERROR: Job does not exist\n");
 			return;
 		}
 	}
 
-	if(bg)
+	if((strcmp(argv[0], "bg") == 0))
 	{
-
+		job->state = BG;
+		kill(-1*job->pid, SIGCONT);
+		printf("(%d) [%d] %s", job->jid, job->pid, job->cmdline);
 	}
 	else
 	{
-		/* code */
+		job->state = FG;
+		kill(-1*job->pid, SIGCONT);
+		waitfg(job->pid);
 	}
-	
-
     return;
 }
 
@@ -323,6 +342,14 @@ void do_bgfg(char **argv)
  */
 void waitfg(pid_t pid)
 {
+	if(verbose)
+		printf("Waitngfg\n");
+    sigset_t maskw;
+    sigemptyset(&maskw);
+    while (fgpid(jobs) == pid)
+	{
+        sigsuspend(&maskw);
+    }
     return;
 }
 
@@ -339,7 +366,34 @@ void waitfg(pid_t pid)
  */
 void sigchld_handler(int sig) 
 {
-	
+	pid_t pid;
+	int child_status;
+
+	while ((pid = waitpid(-1, &child_status, WNOHANG|WUNTRACED)) > 0) 
+	{
+		if (WIFSTOPPED(child_status))
+		{
+			if(verbose)
+				printf("Job Stopped by Signal\n");
+			printf("Job [%d] (%d) stopped by signal %d\n", pid2jid(pid), pid, child_status);
+			getjobpid(jobs, pid)->state = ST;
+		}
+		else if (WIFSIGNALED(child_status))
+		{
+			if(verbose)
+				printf("Job terminated by Signal\n");
+			printf("Job [%d] (%d) terminated by signal %d\n", pid2jid(pid), pid, child_status);
+			deletejob(jobs, pid);
+		}
+		else
+		{
+			if(verbose)
+				printf("OTHER\n");
+			deletejob(jobs, pid);
+		}
+	}
+	if(verbose)
+		printf("----------CHILD HANDLER DONE--------------\n");
     return;
 }
 
@@ -350,6 +404,11 @@ void sigchld_handler(int sig)
  */
 void sigint_handler(int sig) 
 {
+    pid_t pid = fgpid(jobs);
+    if (pid) 
+	{
+    	kill(-pid, SIGINT);
+    }
     return;
 }
 
@@ -360,6 +419,11 @@ void sigint_handler(int sig)
  */
 void sigtstp_handler(int sig) 
 {
+	pid_t pid = fgpid(jobs);
+    if (pid) 
+	{
+   		kill(-pid, SIGTSTP);
+    } 
     return;
 }
 
